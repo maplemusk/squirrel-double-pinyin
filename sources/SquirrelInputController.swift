@@ -18,7 +18,7 @@ final class SquirrelInputController: IMKInputController {
   private var caretPos: Int = 0
   private var lastModifiers: NSEvent.ModifierFlags = .init()
   private var session: RimeSessionId = 0
-  private var schemaId: String = ""
+  private(set) var schemaId: String = ""
   private var inlinePreedit = false
   private var inlineCandidate = false
   // for chord-typing
