@@ -52,9 +52,20 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
     completionHandler()
   }
 
+  
+  // ✅ 新增：菜单栏状态控制器
+  var menuBarController: MenuBarStatusController?
+  
+  // ✅ 新增：标志位，用于禁用切换 schema 时的状态提示
+  var isSwitchingSchemaFromMenu: Bool = false
+    
   func applicationWillFinishLaunching(_ notification: Notification) {
-    panel = SquirrelPanel(position: .zero)
-    addObservers()
+      panel = SquirrelPanel(position: .zero)
+      
+      // ✅ 初始化菜单栏状态指示器
+      menuBarController = MenuBarStatusController()
+      
+      addObservers()
   }
 
   func applicationWillTerminate(_ notification: Notification) {
@@ -232,6 +243,11 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
     rimeAPI.cleanup_all_sessions()
     return .terminateNow
   }
+  
+    // ✅ 新增：设置切换标志
+  func setSwitchingSchemaFromMenu(_ isSwitching: Bool) {
+      isSwitchingSchemaFromMenu = isSwitching
+  }
 
 }
 
@@ -253,6 +269,12 @@ private func notificationHandler(contextObject: UnsafeMutableRawPointer?, sessio
     }
     return
   }
+
+  // ✅ 如果正在从菜单切换 schema，不显示状态提示
+  if delegate.isSwitchingSchemaFromMenu {
+      return
+  }
+
   // off
   if !delegate.enableNotifications {
     return
