@@ -19,6 +19,16 @@ final class SquirrelInputController: IMKInputController {
   private var lastModifiers: NSEvent.ModifierFlags = .init()
   private var session: RimeSessionId = 0
   private(set) var schemaId: String = ""
+  // ✅ 添加状态缓存
+  private var lastNotifiedSchemaId: String = ""
+  
+  // ✅ 新增：全局缓存（类属性，所有实例共享）
+  private static var cachedInlinePreedit: Bool?
+  private static var cachedInlineCandidate: Bool?
+  
+  // ✅ 新增：缓存是否已初始化
+  private static var isCacheInitialized = false
+  
   private var inlinePreedit = false
   private var inlineCandidate = false
   // for chord-typing
@@ -52,6 +62,36 @@ final class SquirrelInputController: IMKInputController {
     if let app = client?.bundleIdentifier(), currentApp != app {
       currentApp = app
       updateAppOptions()
+
+        // ✅ 立即应用缓存（避免闪烁）
+        loadConfigFromCache()
+        
+        // ✅ 异步加载精确配置
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.session != 0 else { return }
+            
+            var status = RimeStatus_stdbool.rimeStructInit()
+            if self.rimeAPI.get_status(self.session, &status) {
+                if let schema_id = status.schema_id {
+                    let currentSchemaId = String(cString: schema_id)
+                    if !currentSchemaId.isEmpty {
+                        NSApp.squirrelAppDelegate.loadSettings(for: currentSchemaId)
+                        self.schemaId = currentSchemaId
+                        
+                        if let panel = NSApp.squirrelAppDelegate.panel {
+                            self.inlinePreedit = (panel.inlinePreedit && !self.rimeAPI.get_option(self.session, "no_inline"))
+                                                || self.rimeAPI.get_option(self.session, "inline")
+                            self.inlineCandidate = panel.inlineCandidate && !self.rimeAPI.get_option(self.session, "no_inline")
+                            self.rimeAPI.set_option(self.session, "soft_cursor", !self.inlinePreedit)
+                            
+                            // ✅ 更新缓存
+                            self.updateCache()
+                        }
+                    }
+                }
+                _ = self.rimeAPI.free_status(&status)
+            }
+        }
     }
 
     switch event.type {
@@ -182,6 +222,133 @@ final class SquirrelInputController: IMKInputController {
       client?.overrideKeyboard(withKeyboardNamed: keyboardLayout)
     }
     preedit = ""
+    
+    // ✅ 2. 确保 session 存在
+    if session == 0 || !rimeAPI.find_session(session) {
+      createSession()
+    }
+    
+    // ✅ 3. 立即从缓存加载配置（关键！）
+    loadConfigFromCache()
+    
+    // ✅ 4. 异步预加载精确配置（不阻塞）
+    if session != 0 {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            
+            var status = RimeStatus_stdbool.rimeStructInit()
+            if self.rimeAPI.get_status(self.session, &status) {
+                if let schema_id = status.schema_id {
+                    let currentSchemaId = String(cString: schema_id)
+                    if !currentSchemaId.isEmpty {
+                        // 只在 schema 变化时重新加载
+                        if self.schemaId != currentSchemaId {
+                            self.schemaId = currentSchemaId
+                            NSApp.squirrelAppDelegate.loadSettings(for: self.schemaId)
+                            
+                            // 重新读取配置
+                            if let panel = NSApp.squirrelAppDelegate.panel {
+                                self.inlinePreedit = (panel.inlinePreedit && !self.rimeAPI.get_option(self.session, "no_inline"))
+                                                    || self.rimeAPI.get_option(self.session, "inline")
+                                self.inlineCandidate = panel.inlineCandidate && !self.rimeAPI.get_option(self.session, "no_inline")
+                                self.rimeAPI.set_option(self.session, "soft_cursor", !self.inlinePreedit)
+                                
+                                // ✅ 更新缓存
+                                self.updateCache()
+                            }
+                        }
+                    }
+                }
+                _ = self.rimeAPI.free_status(&status)
+            }
+        }
+    }
+    // ✅ 5.预加载五笔码表（异步，不阻塞）
+    DispatchQueue.global(qos: .utility).async {
+        WubiCodeManager.shared.loadIfNeeded()
+    }
+    
+    // ✅ 6. 异步状态同步（延迟执行，确保配置已加载）轻量级状态同步（<1ms）
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        self?.syncCurrentState()
+    }
+    
+  }
+
+  // ✅ 新增：主动同步当前状态
+  private func syncCurrentState() {
+    guard session != 0 else {
+      // Session 未初始化，发送失活通知
+      NotificationCenter.default.post(
+        name: .squirrelInputMethodDeactivated,
+        object: nil
+      )
+      return
+    }
+    
+    var status = RimeStatus_stdbool.rimeStructInit()
+    defer { _ = rimeAPI.free_status(&status) }
+    
+    guard rimeAPI.get_status(session, &status) else {
+      // 状态读取失败，发送失活通知
+      NotificationCenter.default.post(
+        name: .squirrelInputMethodDeactivated,
+        object: nil
+      )
+      return
+    }
+    
+    // ✅ 只读取 schema_id
+    if let schema_id = status.schema_id {
+      schemaId = String(cString: schema_id)
+    }
+    
+    // ✅ 发送激活通知
+    NotificationCenter.default.post(
+      name: .squirrelInputMethodActivated,
+      object: nil
+    )
+    
+    // ✅ 发送状态通知（菜单栏立即更新）
+    postStatusNotification(schemaId: schemaId)
+  }
+  
+  // ✅ 新增：从缓存加载配置
+  private func loadConfigFromCache() {
+      guard let panel = NSApp.squirrelAppDelegate.panel else { return }
+      
+      // 如果有缓存，直接使用
+      if let cachedInline = Self.cachedInlinePreedit,
+         let cachedCandidate = Self.cachedInlineCandidate {
+          
+          inlinePreedit = cachedInline
+          inlineCandidate = cachedCandidate
+          
+          if session != 0 {
+              rimeAPI.set_option(session, "soft_cursor", !inlinePreedit)
+          }
+          
+          NSLog("📦 [Cache] Applied cached config: inlinePreedit=\(cachedInline), inlineCandidate=\(cachedCandidate)")
+      } else {
+          // 没有缓存，使用默认值
+          inlinePreedit = panel.inlinePreedit
+          inlineCandidate = panel.inlineCandidate
+          
+          if session != 0 {
+              rimeAPI.set_option(session, "soft_cursor", !inlinePreedit)
+          }
+          
+          NSLog("📦 [Cache] No cache, using defaults: inlinePreedit=\(inlinePreedit), inlineCandidate=\(inlineCandidate)")
+      }
+  }
+  
+  // ✅ 新增：更新缓存
+  private func updateCache() {
+      Self.cachedInlinePreedit = inlinePreedit
+      Self.cachedInlineCandidate = inlineCandidate
+      Self.isCacheInitialized = true
+      
+      NSLog("💾 [Cache] Updated: inlinePreedit=\(inlinePreedit), inlineCandidate=\(inlineCandidate)")
   }
 
   override init!(server: IMKServer!, delegate: Any!, client: Any!) {
@@ -189,10 +356,88 @@ final class SquirrelInputController: IMKInputController {
     // print("[DEBUG] initWithServer: \(server ?? .init()) delegate: \(delegate ?? "nil") client:\(client ?? "nil")")
     super.init(server: server, delegate: delegate, client: client)
     createSession()
+    
+    // ✅ 监听菜单栏的切换命令
+    observeMenuBarCommands()
   }
 
+  // ✅ 监听菜单栏命令
+  private func observeMenuBarCommands() {
+      
+      // 切换输入方案
+      NotificationCenter.default.addObserver(
+          self,
+          selector: #selector(handleSwitchSchema(_:)),
+          name: .squirrelSwitchSchema,
+          object: nil
+      )
+  }
+  
+  @objc private func handleSwitchSchema(_ notification: Notification) {
+      guard session != 0 else {
+          NSLog("⚠️ Session 未初始化，无法切换方案")
+          return
+      }
+      
+      guard let userInfo = notification.userInfo,
+            let schemaId = userInfo["schemaId"] as? String,
+            !schemaId.isEmpty else {
+          NSLog("⚠️ 无效的 schemaId")
+          return
+      }
+      
+      DispatchQueue.main.async { [weak self] in
+          guard let self = self,
+                self.session != 0,
+                self.rimeAPI.find_session(self.session) else {
+              NSLog("⚠️ Session 已失效")
+              return
+          }
+          
+          // ✅ 设置标志，禁用状态提示
+          NSApp.squirrelAppDelegate.setSwitchingSchemaFromMenu(true)
+          
+          schemaId.withCString { cSchemaId in
+              let success = self.rimeAPI.select_schema(self.session, cSchemaId)
+              if success {
+                  NSLog("✅ 方案切换成功: \(schemaId)")
+                  self.schemaId = schemaId
+                  
+                // ✅ 移除了强制设置 ascii_mode 的代码
+                // 保持用户当前的输入模式（中文/英文）
+                
+                NSApp.squirrelAppDelegate.loadSettings(for: schemaId)
+                  self.postStatusNotification()
+                  self.rimeUpdate()
+                  
+                  // ✅ 延迟恢复标志（确保通知已处理完）
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                      NSApp.squirrelAppDelegate.setSwitchingSchemaFromMenu(false)
+                  }
+              } else {
+                  NSLog("❌ 方案切换失败: \(schemaId)")
+                  NSApp.squirrelAppDelegate.setSwitchingSchemaFromMenu(false)
+              }
+          }
+      }
+  }
+  
   override func deactivateServer(_ sender: Any!) {
-    // print("[DEBUG] deactivateServer: \(sender ?? "nil")")
+    // ✅ 发送失活通知
+
+    NotificationCenter.default.post(
+        name: .squirrelInputMethodDeactivated,
+        object: nil
+    )
+    /*
+    DispatchQueue.main.async {
+        NotificationCenter.default.post(
+            name: .squirrelInputMethodDeactivated,
+            object: nil
+        )
+    }
+     */
+    
     hidePalettes()
     commitComposition(sender)
     client = nil
@@ -429,23 +674,40 @@ private extension SquirrelInputController {
     rimeConsumeCommittedText()
 
     var status = RimeStatus_stdbool.rimeStructInit()
+    
     if rimeAPI.get_status(session, &status) {
       // enable schema specific ui style
       // swiftlint:disable:next identifier_name
-      if let schema_id = status.schema_id, schemaId == "" || schemaId != String(cString: schema_id) {
-        schemaId = String(cString: schema_id)
-        NSApp.squirrelAppDelegate.loadSettings(for: schemaId)
-        // inline preedit
-        if let panel = NSApp.squirrelAppDelegate.panel {
-          inlinePreedit = (panel.inlinePreedit && !rimeAPI.get_option(session, "no_inline")) || rimeAPI.get_option(session, "inline")
-          inlineCandidate = panel.inlineCandidate && !rimeAPI.get_option(session, "no_inline")
-          // if not inline, embed soft cursor in preedit string
-          rimeAPI.set_option(session, "soft_cursor", !inlinePreedit)
+      if let schema_id = status.schema_id {
+        let newSchemaId = String(cString: schema_id)
+        
+        // ✅ 首次初始化 OR schema 变化时加载配置
+        if schemaId == "" || schemaId != newSchemaId {
+          schemaId = newSchemaId
+          
+          // ✅ 在此处加载配置（用户已开始输入，延迟可接受）
+          NSApp.squirrelAppDelegate.loadSettings(for: schemaId)
+          
+                // 2. 更新 inline 配置
+                    if let panel = NSApp.squirrelAppDelegate.panel {
+                    inlinePreedit = (panel.inlinePreedit && !rimeAPI.get_option(session, "no_inline"))
+                                    || rimeAPI.get_option(session, "inline")
+                    inlineCandidate = panel.inlineCandidate && !rimeAPI.get_option(session, "no_inline")
+                    // if not inline, embed soft cursor in preedit string
+                    rimeAPI.set_option(session, "soft_cursor", !inlinePreedit)
+
+                    // ✅ 更新缓存（关键！）
+                    updateCache()
+                }
+    
+          // ✅ 发送状态通知（观察式）
+          postStatusNotification()
         }
       }
       _ = rimeAPI.free_status(&status)
     }
-
+    
+    
     var ctx = RimeContext_stdbool.rimeStructInit()
     if rimeAPI.get_context(session, &ctx) {
       // update preedit text
@@ -515,11 +777,39 @@ private extension SquirrelInputController {
       let numCandidates = Int(ctx.menu.num_candidates)
       var candidates = [String]()
       var comments = [String]()
+      
+      // ✅ 预加载五笔码表（如果是第一次）
+      // WubiCodeManager.shared.loadIfNeeded()
+      
+      // ✅ 判断当前是否为双拼方案 (根据 schemaId 判断)
+      let isDoublePinyin = self.schemaId.contains("double_pinyin")
+
       for i in 0..<numCandidates {
         let candidate = ctx.menu.candidates[i]
-        candidates.append(candidate.text.map { String(cString: $0) } ?? "")
-        comments.append(candidate.comment.map { String(cString: $0) } ?? "")
+        let text = candidate.text.map { String(cString: $0) } ?? ""
+        var comment = candidate.comment.map { String(cString: $0) } ?? ""
+        
+        // 🔥🔥🔥 核心修改开始 🔥🔥🔥
+        if isDoublePinyin {
+            // 需求：只匹配单字和2字
+            if text.count >= 1 && text.count <= 2 {
+                if let wubiCode = WubiCodeManager.shared.getCode(for: text) {
+                    // 追加显示，格式可以自定义，例如：(aldj)
+                    // 如果原有 comment 为空，直接显示；如果不为空，加个空格追加
+                    if comment.isEmpty {
+                        comment = "(\(wubiCode))"
+                    } else {
+                        comment += " (\(wubiCode))"
+                    }
+                }
+            }
+        }
+        // 🔥🔥🔥 核心修改结束 🔥🔥🔥
+
+        candidates.append(text)
+        comments.append(comment)
       }
+
       var labels = [String]()
       // swiftlint:disable identifier_name
       if let select_keys = ctx.menu.select_keys {
@@ -543,6 +833,48 @@ private extension SquirrelInputController {
       hidePalettes()
     }
   }
+  
+  // ✅ 新增：带参数的版本（用于主动同步）
+  private func postStatusNotification(schemaId: String) {
+      guard session != 0 else { return }
+      
+      // 只在状态真正改变时发送通知
+      if schemaId != lastNotifiedSchemaId {
+          
+          lastNotifiedSchemaId = schemaId
+          
+          NotificationCenter.default.post(
+              name: .squirrelInputStateChanged,
+              object: nil,
+              userInfo: ["schemaId": schemaId]
+          )
+      }
+  }
+  
+  // ✅ 优化后的状态通知方法
+  // ✅ 保留原有版本（用于 rimeUpdate）
+  private func postStatusNotification() {
+      guard session != 0 else { return }
+
+      postStatusNotification(schemaId: schemaId)
+  }
+  /*
+  private func postStatusNotification() {
+      guard session != 0 else { return }
+      
+      // 只在状态真正改变时发送通知
+      if schemaId != lastNotifiedSchemaId {
+          
+          lastNotifiedSchemaId = schemaId
+          
+          NotificationCenter.default.post(
+              name: .squirrelInputStateChanged,
+              object: nil,
+              userInfo: ["schemaId": schemaId]
+          )
+      }
+  }
+   */
 
   func commit(string: String) {
     guard let client = client else { return }
