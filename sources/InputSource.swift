@@ -117,3 +117,52 @@ final class SquirrelInstaller {
     return CFBooleanGetValue(enabled)
   }
 }
+
+// MARK: - 为了双拼下的五笔反查尔增加
+
+final class WubiCodeManager {
+    static let shared = WubiCodeManager()
+    
+    private var codeMap: [String: String] = [:]
+    private var isLoaded = false
+    
+    // 异步加载或者是首次访问加载
+    func loadIfNeeded() {
+        guard !isLoaded else { return }
+        
+        // 获取用户目录 ~/Library/Rime/wubi06_word_code.txt
+        let fileURL = SquirrelApp.userDir.appendingPathComponent("wubi06_word_code.txt")
+        
+        do {
+            let content = try String(contentsOf: fileURL, encoding: .utf8)
+            let lines = content.components(separatedBy: .newlines)
+            
+            for line in lines {
+                // 跳过注释或空行
+                if line.isEmpty || line.hasPrefix("#") { continue }
+                
+                // 假设格式为：字/词[tab/空格]编码
+                // 例如: 蔑   ald
+                let parts = line.split(whereSeparator: \.isWhitespace)
+                if parts.count >= 2 {
+                    let word = String(parts[0])
+                    let code = String(parts[1])
+                    
+                    // 仅加载单字和二字词（根据你的需求优化内存）
+                    if word.count <= 2 {
+                        codeMap[word] = code
+                    }
+                }
+            }
+            isLoaded = true
+            print("✅ [Squirrel] Wubi codes loaded: \(codeMap.count) entries")
+        } catch {
+            print("⚠️ [Squirrel] Failed to load wubi codes: \(error)")
+        }
+    }
+    
+    func getCode(for text: String) -> String? {
+        if !isLoaded { loadIfNeeded() }
+        return codeMap[text]
+    }
+}
